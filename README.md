@@ -8,14 +8,20 @@ focus rules, keybinds and animations are plain Lua in `init.lua`.
 
 ## Status
 
-Stage 1: runs nested in another Wayland compositor (winit backend).
+Runs nested in another Wayland compositor (winit) or as the real compositor
+from a TTY (DRM/KMS, libinput, libseat; one GPU, monitors left to right in
+their preferred modes). No XWayland, layer-shell or session lock yet.
 
 ## Run
 
 ```sh
 cargo build
-./target/debug/mywm          # opens as a window inside your current session
+./target/debug/mywm          # inside a Wayland session: opens as a window
+                             # on a TTY: takes over the screen
 ```
+
+On a TTY the log goes to `~/.local/state/mywm/mywm.log`, Ctrl+Alt+F1..F12
+switch VTs, and the pointer uses `$XCURSOR_THEME` / `$XCURSOR_SIZE`.
 
 Inside MyWM `$MYWM_SOCKET` is set; from outside, the only running session is
 used.
@@ -24,7 +30,18 @@ used.
 mywm reload                  # reload the config; a broken one keeps the old running
 mywm eval 'return #wm.clients()'
 mywm quit
+
+mywm set config <dir>        # switch config (or just save it if MyWM is not running)
+mywm set config <dir> -t     # only for this session, keep the saved choice
+mywm set config <dir> -r -t  # try a config in a new MyWM window, change nothing
+mywm get config              # what runs and why: (saved), (temp, ...), (default)
+mywm set autoreload [true|false]  # reload on file changes; no value toggles
+mywm get autoreload
+mywm check [dir]             # load a config without side effects and report errors
 ```
+
+The saved choice lives in `$XDG_STATE_HOME/mywm/config`. A config can turn
+autoreload on for itself with `wm.autoreload(true)`.
 
 Ctrl+Alt+Backspace always quits, whatever the config does.
 
@@ -32,7 +49,10 @@ Ctrl+Alt+Backspace always quits, whatever the config does.
 
 Searched in order: `~/.config/mywm/init.lua`, `/etc/xdg/mywm/init.lua`, then
 the built-in [config/init.lua](config/init.lua) (master-stack tiling with 9
-workspaces). Copy that file to start your own. When nested, it uses Alt
+workspaces). Copy that file to start your own.
+[examples/autotiling](examples/autotiling/init.lua) is the same with a
+different layout: every new window splits the focused one along its longer
+side (Mod+R flips a split, Mod+= / Mod+- move the divider). When nested, it uses Alt
 instead of Super, since the host compositor keeps Super combos.
 
 Key ideas of the API:

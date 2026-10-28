@@ -4,7 +4,6 @@
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
-    path::PathBuf,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -16,6 +15,7 @@ use mlua::{
 use tracing::{error, info};
 
 use crate::{
+    config::ConfigSource,
     scene::{self, Easing, NodeId, NodeKind, Prop, TickResult},
     state::{Command, Event, KeyboardSettings, Shared, Stage},
 };
@@ -26,48 +26,6 @@ const DEFAULT_CONFIG: &str = include_str!("../../config/init.lua");
 /// How long one call into Lua may run before the watchdog stops it.
 const CALL_LIMIT: Duration = Duration::from_secs(1);
 const LOAD_LIMIT: Duration = Duration::from_secs(5);
-
-pub enum ConfigSource {
-    File(PathBuf),
-    Embedded,
-}
-
-impl ConfigSource {
-    pub fn describe(&self) -> String {
-        match self {
-            ConfigSource::File(p) => p.display().to_string(),
-            ConfigSource::Embedded => "built-in default config".into(),
-        }
-    }
-
-    fn dir(&self) -> PathBuf {
-        match self {
-            ConfigSource::File(p) => p.parent().map(PathBuf::from).unwrap_or_default(),
-            ConfigSource::Embedded => user_config_dir(),
-        }
-    }
-}
-
-pub fn user_config_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
-    base.join("mywm")
-}
-
-/// Configs in the order they are tried: the user's, the system one, the
-/// one built into the binary.
-pub fn candidates() -> Vec<ConfigSource> {
-    let mut out = Vec::new();
-    for path in [user_config_dir().join("init.lua"), PathBuf::from("/etc/xdg/mywm/init.lua")] {
-        if path.is_file() {
-            out.push(ConfigSource::File(path));
-        }
-    }
-    out.push(ConfigSource::Embedded);
-    out
-}
 
 /// Lua 5.4 has integers and floats; both are numbers here.
 fn number_of(v: &Value) -> Option<f64> {
@@ -96,6 +54,8 @@ fn error_text(e: &mlua::Error) -> String {
 struct Ctx {
     shared: Rc<RefCell<Shared>>,
     generation: u32,
+    /// `mywm check`: run the config without side effects
+    dry_run: bool,
     /// one userdata per node, so a node keeps its identity in Lua
     nodes: Rc<RefCell<HashMap<NodeId, AnyUserData>>>,
     /// animation group -> its `done` callback
@@ -321,10 +281,28 @@ pub struct LuaRuntime {
 impl LuaRuntime {
     /// Create a Lua state, run the prelude and then the config.
     pub fn new(shared: Rc<RefCell<Shared>>, generation: u32, source: &ConfigSource, nested: bool) -> Result<Self, String> {
+        Self::create(shared, generation, source, nested, false)
+    }
+
+    /// Run a config against a throwaway state: catches syntax errors, typos
+    /// in constants and wrong API use at load time, without spawning anything.
+    pub fn check(source: &ConfigSource) -> Result<(), String> {
+        let shared = Rc::new(RefCell::new(Shared::new(Instant::now())));
+        Self::create(shared, 1, source, true, true).map(|_| ())
+    }
+
+    fn create(
+        shared: Rc<RefCell<Shared>>,
+        generation: u32,
+        source: &ConfigSource,
+        nested: bool,
+        dry_run: bool,
+    ) -> Result<Self, String> {
         let lua = unsafe { Lua::unsafe_new_with(StdLib::ALL_SAFE | StdLib::DEBUG, LuaOptions::default()) };
         let ctx = Ctx {
             shared,
             generation,
+            dry_run,
             nodes: Rc::default(),
             done: Rc::default(),
         };
@@ -609,13 +587,23 @@ fn install_core(lua: &Lua, ctx: &Ctx) -> mlua::Result<Table> {
         Ok(list)
     })?)?;
 
-    core.set("spawn", lua.create_function(|_, cmd: Value| {
+    let c = ctx.clone();
+    core.set("spawn", lua.create_function(move |_, cmd: Value| {
         let argv = match cmd {
             Value::String(s) => vec!["/bin/sh".into(), "-c".into(), s.to_str()?.to_string()],
             Value::Table(t) => t.sequence_values::<String>().collect::<mlua::Result<Vec<_>>>()?,
             _ => return Err(rt_err("wm.spawn: expected a command string or a table of arguments")),
         };
+        if c.dry_run {
+            return Ok(());
+        }
         crate::state::spawn(&argv).map_err(|e| rt_err(format!("wm.spawn: {e}")))
+    })?)?;
+
+    let c = ctx.clone();
+    core.set("autoreload", lua.create_function(move |_, on: bool| {
+        c.shared.borrow_mut().commands.push(Command::Autoreload(on));
+        Ok(())
     })?)?;
 
     let c = ctx.clone();

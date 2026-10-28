@@ -4,7 +4,7 @@
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event as _, InputBackend, InputEvent, KeyState,
-        KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+        KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
     },
     input::{
         keyboard::{Keycode, Keysym},
@@ -20,10 +20,23 @@ const MOD_CTRL: u32 = 2;
 const MOD_ALT: u32 = 4;
 const MOD_SUPER: u32 = 8;
 
+/// XF86Switch_VT_1; Ctrl+Alt+F1 produces it with the default keymap
+const KEY_SWITCH_VT_1: u32 = 0x1008_fe01;
+
 impl State {
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
         match event {
             InputEvent::Keyboard { event, .. } => self.on_key(event.key_code(), event.state(), event.time_msec()),
+            // a real mouse (libinput) reports movement, not positions
+            InputEvent::PointerMotion { event, .. } => {
+                let pointer = self.seat.get_pointer().unwrap();
+                let mut pos = pointer.current_location() + event.delta();
+                if let Some(b) = self.shared.borrow().outputs_bbox() {
+                    pos.x = pos.x.clamp(b.loc.x as f64, (b.loc.x + b.size.w) as f64 - 1.0);
+                    pos.y = pos.y.clamp(b.loc.y as f64, (b.loc.y + b.size.h) as f64 - 1.0);
+                }
+                self.pointer_motion(pos, event.time_msec());
+            }
             InputEvent::PointerMotionAbsolute { event, .. } => {
                 let Some(geo) = self.shared.borrow().output_geometry() else { return };
                 let pos = event.position_transformed(geo.size) + geo.loc.to_f64();
@@ -39,7 +52,7 @@ impl State {
 
     fn on_key(&mut self, code: Keycode, state: KeyState, time: u32) {
         let keyboard = self.seat.get_keyboard().unwrap();
-        let ((sym, mods), mods_changed) = keyboard.input_intercept::<(u32, u32), _>(self, code, state, |_, m, h| {
+        let ((sym, mods, modified), mods_changed) = keyboard.input_intercept::<(u32, u32, u32), _>(self, code, state, |_, m, h| {
             // the key as it is in the first latin layout, without modifiers:
             // binds keep working with the Russian layout and with Shift held
             let sym = h.raw_latin_sym_or_raw_current_sym().unwrap_or_else(|| h.modified_sym());
@@ -56,13 +69,22 @@ impl State {
             if m.logo {
                 bits |= MOD_SUPER;
             }
-            (sym.raw(), bits)
+            (sym.raw(), bits, h.modified_sym().raw())
         });
         let pressed = state == KeyState::Pressed;
 
         // Emergency exit that no config can take away.
         if pressed && mods & (MOD_CTRL | MOD_ALT) == (MOD_CTRL | MOD_ALT) && sym == Keysym::BackSpace.raw() {
             self.loop_signal.stop();
+            return;
+        }
+
+        // VT switching belongs to the session, not to the config
+        if pressed
+            && (KEY_SWITCH_VT_1..KEY_SWITCH_VT_1 + 12).contains(&modified)
+            && let Some(udev) = self.udev.as_mut()
+        {
+            udev.change_vt((modified - KEY_SWITCH_VT_1 + 1) as i32);
             return;
         }
 

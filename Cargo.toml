@@ -9,13 +9,24 @@ license = "MIT"
 clap = { version = "4", features = ["derive"] }
 mlua = { version = "0.12", features = ["lua54"] }
 slotmap = "1"
+xcursor = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dependencies.smithay]
 version = "0.7"
 default-features = false
-features = ["backend_winit", "wayland_frontend", "desktop"]
+features = [
+    "backend_winit",
+    "backend_drm",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_udev",
+    "backend_session_libseat",
+    "renderer_gl",
+    "wayland_frontend",
+    "desktop",
+]
 
 [profile.dev.package."*"]
 opt-level = 2

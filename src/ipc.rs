@@ -55,7 +55,7 @@ fn serve(state: &mut State, mut stream: UnixStream) {
         .and_then(|_| stream.set_read_timeout(Some(Duration::from_secs(1))))
         .and_then(|_| stream.read_to_string(&mut request));
     if read.is_err() || request.is_empty() {
-        return; // a probe from `find_socket`, or a broken client
+        return; // a probe from `session`, or a broken client
     }
     let (cmd, payload) = request.split_once('\n').unwrap_or((&request, ""));
 
@@ -66,6 +66,26 @@ fn serve(state: &mut State, mut stream: UnixStream) {
             Ok(String::new())
         }
         "eval" => state.eval(payload),
+        "set-config" => {
+            let (path, temp) = payload.split_once('\n').unwrap_or((payload, "0"));
+            state
+                .set_config(path.into(), temp == "1")
+                .map(|src| format!("config: {src}"))
+        }
+        "set-autoreload" => {
+            let on = match payload {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            };
+            let on = state.set_autoreload(on);
+            Ok(format!("autoreload: {}", if on { "on" } else { "off" }))
+        }
+        "get" => match payload {
+            "config" => Ok(state.describe_config()),
+            "autoreload" => Ok(if state.autoreload { "on" } else { "off" }.to_string()),
+            other => Err(format!("unknown setting '{other}'")),
+        },
         other => Err(format!("unknown command '{other}'")),
     };
     let text = match reply {
@@ -76,10 +96,10 @@ fn serve(state: &mut State, mut stream: UnixStream) {
 }
 
 /// The socket of the session to talk to: $MYWM_SOCKET inside MyWM, or the
-/// only running session otherwise.
-fn find_socket() -> Result<PathBuf, String> {
+/// only running session otherwise. Ok(None) means no session is running.
+pub fn session() -> Result<Option<PathBuf>, String> {
     if let Some(p) = std::env::var_os("MYWM_SOCKET") {
-        return Ok(p.into());
+        return Ok(Some(p.into()));
     }
     let mut found = Vec::new();
     if let Ok(entries) = std::fs::read_dir(runtime_dir()) {
@@ -92,8 +112,8 @@ fn find_socket() -> Result<PathBuf, String> {
         }
     }
     match found.len() {
-        0 => Err("MyWM is not running".into()),
-        1 => Ok(found.remove(0)),
+        0 => Ok(None),
+        1 => Ok(Some(found.remove(0))),
         _ => Err(format!(
             "several MyWM sessions are running; set MYWM_SOCKET to one of:\n{}",
             found.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n")
@@ -102,7 +122,7 @@ fn find_socket() -> Result<PathBuf, String> {
 }
 
 pub fn send(cmd: &str, payload: &str) -> Result<String, String> {
-    let path = find_socket()?;
+    let path = session()?.ok_or("MyWM is not running")?;
     let mut stream = UnixStream::connect(&path).map_err(|e| format!("cannot connect to {}: {e}", path.display()))?;
     stream
         .write_all(format!("{cmd}\n{payload}").as_bytes())

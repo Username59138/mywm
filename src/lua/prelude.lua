@@ -323,6 +323,10 @@ wm = strict("wm field", "wm.", {
 
   spawn  = core.spawn,
   reload = core.reload,
+  autoreload = function(on)
+    if type(on) ~= "boolean" then error("wm.autoreload: expected true or false", 2) end
+    core.autoreload(on)
+  end,
   quit   = core.quit,
   time   = core.time,
 

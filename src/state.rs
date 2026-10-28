@@ -2,21 +2,23 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     ffi::OsString,
+    path::PathBuf,
     rc::Rc,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant, SystemTime},
 };
 
 use smithay::{
-    backend::{
-        renderer::{damage::OutputDamageTracker, gles::GlesRenderer},
-        winit::WinitGraphicsBackend,
-    },
+    backend::{allocator::Format, renderer::gles::GlesRenderer},
     desktop::{PopupManager, Window, WindowSurfaceType},
-    input::{Seat, SeatState, keyboard::XkbConfig},
+    input::{Seat, SeatState, keyboard::XkbConfig, pointer::CursorImageStatus},
     output::Output,
     reexports::{
-        calloop::{EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, generic::Generic},
+        calloop::{
+            EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction,
+            generic::Generic,
+            timer::{TimeoutAction, Timer},
+        },
         wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode,
         wayland_server::{
             Display, DisplayHandle,
@@ -27,6 +29,7 @@ use smithay::{
     utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Size},
     wayland::{
         compositor::{CompositorClientState, CompositorState},
+        dmabuf::{DmabufGlobal, DmabufState},
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
         shell::xdg::{ToplevelSurface, XdgShellState, decoration::XdgDecorationState},
@@ -37,10 +40,16 @@ use smithay::{
 use tracing::{error, info, warn};
 
 use crate::{
-    lua::{self, LuaRuntime},
+    config::{self, ConfigSource},
+    udev::UdevData,
+    winit::WinitData,
+    lua::LuaRuntime,
     scene::{CORE_OWNER, ClientId, NodeId, Scene},
     snapshot::Snapshot,
 };
+
+/// How often autoreload looks at the config files.
+const AUTORELOAD_POLL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Stage {
@@ -90,8 +99,16 @@ pub struct KeyboardSettings {
 pub enum Command {
     Focus(Option<ClientId>),
     Keyboard(KeyboardSettings),
+    Autoreload(bool),
     Reload,
     Quit,
+}
+
+/// The config picked with `mywm set config` (its init.lua).
+pub struct Chosen {
+    pub path: PathBuf,
+    /// only for this session; the saved choice stays as it was
+    pub temp: bool,
 }
 
 pub enum Event {
@@ -115,6 +132,17 @@ pub struct Shared {
 }
 
 impl Shared {
+    pub fn new(start: Instant) -> Self {
+        Shared {
+            scene: Scene::new(),
+            clients: HashMap::new(),
+            outputs: Vec::new(),
+            commands: Vec::new(),
+            start,
+            next_client: 1,
+        }
+    }
+
     pub fn client_by_surface(&self, surface: &WlSurface) -> Option<ClientId> {
         self.clients
             .iter()
@@ -159,6 +187,14 @@ impl Shared {
             }
         }
         None
+    }
+
+    /// The rectangle around all outputs; the pointer stays inside it.
+    pub fn outputs_bbox(&self) -> Option<Rectangle<i32, Logical>> {
+        self.outputs
+            .iter()
+            .map(|o| Rectangle::new((o.x, o.y).into(), (o.width, o.height).into()))
+            .reduce(|a, b| a.merge(b))
     }
 
     pub fn output_geometry(&self) -> Option<Rectangle<i32, Logical>> {
@@ -222,9 +258,11 @@ pub struct State {
     pub popups: PopupManager,
     pub seat: Seat<Self>,
 
-    pub backend: Option<WinitGraphicsBackend<GlesRenderer>>,
-    pub output: Option<Output>,
-    pub damage_tracker: Option<OutputDamageTracker>,
+    pub winit: Option<WinitData>,
+    pub udev: Option<UdevData>,
+    pub outputs: Vec<Output>,
+    pub cursor_status: CursorImageStatus,
+    pub dmabuf: Option<(DmabufState, DmabufGlobal)>,
 
     pub shared: Rc<RefCell<Shared>>,
     pub lua: Option<LuaRuntime>,
@@ -234,6 +272,12 @@ pub struct State {
     pub suppressed_keys: HashSet<u32>,
     pub suppressed_buttons: HashSet<u32>,
     repeat_info: (i32, i32),
+
+    pub chosen: Option<Chosen>,
+    /// the file of the running config; None for the built-in one
+    pub loaded: Option<PathBuf>,
+    pub autoreload: bool,
+    autoreload_stamp: (Option<SystemTime>, usize),
 }
 
 impl State {
@@ -257,6 +301,14 @@ impl State {
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
 
+        event_loop
+            .handle()
+            .insert_source(Timer::from_duration(AUTORELOAD_POLL), |_, _, state| {
+                state.check_autoreload();
+                TimeoutAction::ToDuration(AUTORELOAD_POLL)
+            })
+            .expect("cannot add the autoreload timer");
+
         Self {
             start_time,
             socket_name,
@@ -273,23 +325,22 @@ impl State {
             data_device_state,
             popups: PopupManager::default(),
             seat,
-            backend: None,
-            output: None,
-            damage_tracker: None,
-            shared: Rc::new(RefCell::new(Shared {
-                scene: Scene::new(),
-                clients: HashMap::new(),
-                outputs: Vec::new(),
-                commands: Vec::new(),
-                start: start_time,
-                next_client: 1,
-            })),
+            winit: None,
+            udev: None,
+            outputs: Vec::new(),
+            cursor_status: CursorImageStatus::default_named(),
+            dmabuf: None,
+            shared: Rc::new(RefCell::new(Shared::new(start_time))),
             lua: None,
             lua_gen: CORE_OWNER,
             keyboard_focus: None,
             suppressed_keys: HashSet::new(),
             suppressed_buttons: HashSet::new(),
             repeat_info,
+            chosen: None,
+            loaded: None,
+            autoreload: false,
+            autoreload_stamp: (None, 0),
         }
     }
 
@@ -323,23 +374,55 @@ impl State {
     }
 
     pub fn update_outputs(&mut self) {
-        let mut outputs = Vec::new();
-        if let Some(o) = &self.output
-            && let Some(mode) = o.current_mode()
-        {
-            let scale = o.current_scale().fractional_scale();
-            let size = mode.size.to_f64().to_logical(scale);
-            let loc = o.current_location();
-            outputs.push(OutputInfo {
-                name: o.name(),
-                x: loc.x,
-                y: loc.y,
-                width: size.w.round() as i32,
-                height: size.h.round() as i32,
-                scale,
-            });
-        }
+        let outputs = self
+            .outputs
+            .iter()
+            .filter_map(|o| {
+                let mode = o.current_mode()?;
+                let scale = o.current_scale().fractional_scale();
+                let size = mode.size.to_f64().to_logical(scale);
+                let loc = o.current_location();
+                Some(OutputInfo {
+                    name: o.name(),
+                    x: loc.x,
+                    y: loc.y,
+                    width: size.w.round() as i32,
+                    height: size.h.round() as i32,
+                    scale,
+                })
+            })
+            .collect();
         self.shared.borrow_mut().outputs = outputs;
+    }
+
+    /// The renderer of whichever backend runs.
+    pub fn renderer(&mut self) -> Option<&mut GlesRenderer> {
+        if let Some(w) = self.winit.as_mut() {
+            return Some(w.backend.renderer());
+        }
+        self.udev.as_mut().and_then(|u| u.renderer())
+    }
+
+    /// linux-dmabuf, so GPU clients can hand over their buffers.
+    pub fn init_dmabuf(&mut self, formats: impl IntoIterator<Item = Format>) {
+        if self.dmabuf.is_some() {
+            return;
+        }
+        let mut state = DmabufState::new();
+        let global = state.create_global::<State>(&self.display_handle, formats);
+        self.dmabuf = Some((state, global));
+    }
+
+    /// Work before every frame: animations, their callbacks, the commands
+    /// they queued, closed windows nobody shows, and the pointer focus.
+    pub fn pre_frame(&mut self) {
+        let tick = self.shared.borrow_mut().scene.tick(Instant::now());
+        if let Some(rt) = &self.lua {
+            rt.animations_done(&tick);
+        }
+        self.process_commands();
+        self.shared.borrow_mut().collect_closed();
+        self.refresh_pointer_focus();
     }
 
     /// Send an event to the config and run the commands it queued.
@@ -381,6 +464,9 @@ impl State {
                         Ok(src) => info!("config reloaded ({src})"),
                         Err(e) => error!("config reload failed, keeping the old one:\n{e}"),
                     },
+                    Command::Autoreload(on) => {
+                        self.set_autoreload(Some(on));
+                    }
                     Command::Quit => self.loop_signal.stop(),
                 }
             }
@@ -422,7 +508,8 @@ impl State {
 
     /// Load the config at startup, falling back through the candidates.
     pub fn load_initial_config(&mut self) {
-        match self.load_config(lua::candidates()) {
+        let chosen = self.chosen.as_ref().map(|c| c.path.clone());
+        match self.load_config(config::candidates(chosen.as_deref())) {
             Ok(src) => info!("config loaded ({src})"),
             Err(e) => error!("no config could be loaded, running in emergency mode:\n{e}"),
         }
@@ -431,16 +518,80 @@ impl State {
     /// Reload the highest-priority config. If it fails, the running config
     /// stays as it was.
     pub fn reload(&mut self) -> Result<String, String> {
-        let first = lua::candidates().into_iter().take(1).collect();
+        let chosen = self.chosen.as_ref().map(|c| c.path.clone());
+        let first = config::candidates(chosen.as_deref()).into_iter().take(1).collect();
         self.load_config(first)
     }
 
-    fn load_config(&mut self, sources: Vec<lua::ConfigSource>) -> Result<String, String> {
+    /// Switch to another config; on failure the running one stays.
+    pub fn set_config(&mut self, path: PathBuf, temp: bool) -> Result<String, String> {
+        let src = self.load_config(vec![ConfigSource::File(path.clone())])?;
+        self.chosen = Some(Chosen { path, temp });
+        Ok(src)
+    }
+
+    /// `mywm get config`: what runs and why.
+    pub fn describe_config(&self) -> String {
+        let loaded = match &self.loaded {
+            Some(p) => p.display().to_string(),
+            None => "built-in default config".into(),
+        };
+        match &self.chosen {
+            Some(c) if self.loaded.as_ref() != Some(&c.path) => {
+                format!("{loaded} (fallback: {} failed to load)", c.path.display())
+            }
+            Some(c) if c.temp => {
+                let saved = config::saved().map_or("none".into(), |p| p.display().to_string());
+                format!("{loaded} (temp, saved: {saved})")
+            }
+            Some(_) => format!("{loaded} (saved)"),
+            None => format!("{loaded} (default)"),
+        }
+    }
+
+    /// None toggles. Returns the new value.
+    pub fn set_autoreload(&mut self, on: Option<bool>) -> bool {
+        let on = on.unwrap_or(!self.autoreload);
+        if on && !self.autoreload {
+            self.autoreload_stamp = config::stamp(&self.config_dir());
+        }
+        self.autoreload = on;
+        on
+    }
+
+    fn config_dir(&self) -> PathBuf {
+        match &self.loaded {
+            Some(p) => p.parent().map(PathBuf::from).unwrap_or_default(),
+            None => config::user_config_dir(),
+        }
+    }
+
+    /// Called by a timer: reload when a Lua file of the config changed.
+    pub fn check_autoreload(&mut self) {
+        if !self.autoreload {
+            return;
+        }
+        let stamp = config::stamp(&self.config_dir());
+        if stamp == self.autoreload_stamp {
+            return;
+        }
+        self.autoreload_stamp = stamp;
+        match self.reload() {
+            Ok(src) => info!("config changed, reloaded ({src})"),
+            Err(e) => error!("config changed but failed to load, keeping the old one:\n{e}"),
+        }
+    }
+
+    fn load_config(&mut self, sources: Vec<ConfigSource>) -> Result<String, String> {
         let generation = self.lua_gen + 1;
         let mut errors = Vec::new();
         for src in sources {
             match LuaRuntime::new(self.shared.clone(), generation, &src, self.nested) {
                 Ok(rt) => {
+                    self.loaded = match &src {
+                        ConfigSource::File(p) => Some(p.clone()),
+                        ConfigSource::Embedded => None,
+                    };
                     self.install_runtime(rt, generation);
                     return Ok(src.describe());
                 }

@@ -2,9 +2,15 @@
 //! events the config sees: `client.new`, `client.ready`, `client.closed`.
 
 use smithay::{
-    backend::renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state},
-    delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm, delegate_xdg_decoration,
-    delegate_xdg_shell,
+    backend::{
+        allocator::dmabuf::Dmabuf,
+        renderer::{
+            ImportDma,
+            utils::{on_commit_buffer_handler, with_renderer_surface_state},
+        },
+    },
+    delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_output, delegate_seat, delegate_shm,
+    delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{PopupKind, Window, find_popup_root_surface, get_popup_toplevel_coords},
     input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus},
     reexports::{
@@ -17,6 +23,7 @@ use smithay::{
     utils::Serial,
     wayland::{
         buffer::BufferHandler,
+        dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         compositor::{
             BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
             get_parent, is_sync_subsurface, with_states,
@@ -110,8 +117,8 @@ impl State {
     }
 
     fn take_snapshot(&mut self, id: u64, window: &Window) {
-        let Some(backend) = self.backend.as_mut() else { return };
-        let snap = snapshot::take(backend.renderer(), window);
+        let Some(renderer) = self.renderer() else { return };
+        let snap = snapshot::take(renderer, window);
         if let Some(e) = self.shared.borrow_mut().clients.get_mut(&id) {
             e.snapshot = snap;
         }
@@ -312,7 +319,9 @@ impl SeatHandler for State {
         &mut self.seat_state
     }
 
-    fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {}
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        self.cursor_status = image;
+    }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         let dh = &self.display_handle;
@@ -336,6 +345,23 @@ impl ServerDndGrabHandler for State {}
 
 impl OutputHandler for State {}
 
+impl DmabufHandler for State {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf.as_mut().expect("dmabuf global without state").0
+    }
+
+    fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
+        let imported = self
+            .renderer()
+            .is_some_and(|r| r.import_dmabuf(&dmabuf, None).is_ok());
+        if imported {
+            let _ = notifier.successful::<State>();
+        } else {
+            notifier.failed();
+        }
+    }
+}
+
 delegate_compositor!(State);
 delegate_shm!(State);
 delegate_xdg_shell!(State);
@@ -343,3 +369,4 @@ delegate_xdg_decoration!(State);
 delegate_seat!(State);
 delegate_data_device!(State);
 delegate_output!(State);
+delegate_dmabuf!(State);
