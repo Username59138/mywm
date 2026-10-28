@@ -84,13 +84,32 @@ local events = strict("event group", "", {
     ready  = event("client.ready"),
     closed = event("client.closed"),
     resize = event("client.resize"),
+    title  = event("client.title"),
+    enter  = event("client.enter"),
+    leave  = event("client.leave"),
+    request_fullscreen = event("client.request_fullscreen"),
+    request_maximize   = event("client.request_maximize"),
+    request_minimize   = event("client.request_minimize"),
+    request_move       = event("client.request_move"),
+    request_resize     = event("client.request_resize"),
   }),
   output = strict("event", "output.", {
-    change = event("output.change"),
+    added   = event("output.added"),
+    removed = event("output.removed"),
+    change  = event("output.change"),
+    frame   = event("output.frame"),
+  }),
+  layer = strict("event", "layer.", {
+    new    = event("layer.new"),
+    ready  = event("layer.ready"),
+    change = event("layer.change"),
+    closed = event("layer.closed"),
   }),
   input = strict("event", "input.", {
     key    = event("input.key"),
     button = event("input.button"),
+    motion = event("input.motion"),
+    scroll = event("input.scroll"),
   }),
 })
 
@@ -104,9 +123,14 @@ local function on(ev, fn)
   end
   local list = handlers[name]
   list[#list + 1] = fn
+  core.subscribed(name, true)
   return function()
     for i, h in ipairs(list) do
-      if h == fn then table.remove(list, i) return end
+      if h == fn then
+        table.remove(list, i)
+        if #list == 0 then core.subscribed(name, false) end
+        return
+      end
     end
   end
 end
@@ -143,13 +167,37 @@ local easing_names = {}
 for _, n in ipairs(core.easings()) do easing_names[n] = n end
 local easing = strict("easing", "", easing_names)
 
+local levels = strict("notification level", "", { info = "info", warn = "warn", error = "error" })
+
+local notify_fields = { level = true, timeout = true }
+-- wm.notify(text, { level = wm.level.warn, timeout = seconds (0 = until clicked) })
+local function notify(text, opts)
+  if type(text) ~= "string" then text = tostring(text) end
+  opts = opts or {}
+  check_keys("wm.notify", opts, notify_fields)
+  local level = opts.level or "info"
+  if level ~= "info" and level ~= "warn" and level ~= "error" then
+    error("wm.notify: level must be wm.level.info, warn or error", 2)
+  end
+  if opts.timeout ~= nil and type(opts.timeout) ~= "number" then
+    error("wm.notify: timeout must be a number of seconds", 2)
+  end
+  core.notify(text, level, opts.timeout)
+end
+
+local accel = strict("accel profile", "", { flat = "flat", adaptive = "adaptive" })
+
 local decoration = strict("decoration mode", "", { client = "client", server = "server" })
 
 ---- clients ----
 
 local clients = {}                                -- id -> client table
 local client_ids = setmetatable({}, { __mode = "k" }) -- client table -> id
-local live = { title = true, app_id = true, width = true, height = true, closed = true }
+local live = {
+  title = true, app_id = true, width = true, height = true, closed = true, x11 = true,
+  pid = true, min_width = true, min_height = true, max_width = true, max_height = true,
+  fullscreen = true, maximized = true, tiled = true, window_type = true,
+}
 local methods = {}
 
 local function id_of(c, fname)
@@ -167,6 +215,81 @@ end
 
 function methods.close(c)
   core.client_close(id_of(c, "client:close"))
+end
+
+-- strips "runtime error: " and the traceback from a core error
+local function rethrow(err, level)
+  error(tostring(err):match("^[^\n]*"):gsub("^runtime error: ", ""), level + 1)
+end
+
+-- x, y in the window's own coordinates (0, 0 = top left of its content);
+-- false if no part of the window is there
+function methods.click(c, x, y, button)
+  local id = id_of(c, "client:click")
+  if type(x) ~= "number" or type(y) ~= "number" then
+    error("client:click: expected x and y", 2)
+  end
+  if button ~= nil and type(button) ~= "number" then
+    error("client:click: expected a button from wm.button, got " .. describe(button), 2)
+  end
+  return core.client_click(id, x, y, button or buttons.left)
+end
+
+function methods.type(c, text)
+  local id = id_of(c, "client:type")
+  if type(text) ~= "string" then error("client:type: expected a string, got " .. describe(text), 2) end
+  local ok, err = pcall(core.client_type, id, text)
+  if not ok then rethrow(err, 2) end
+end
+
+-- a key from wm.key, with wm.mod bits held: c:key(wm.key.c, wm.mod.ctrl)
+function methods.key(c, k, m)
+  local id = id_of(c, "client:key")
+  if type(k) ~= "number" then error("client:key: expected a key from wm.key, got " .. describe(k), 2) end
+  if m ~= nil and type(m) ~= "number" then
+    error("client:key: expected modifiers from wm.mod, got " .. describe(m), 2)
+  end
+  local ok, err = pcall(core.client_key, id, k, m)
+  if not ok then rethrow(err, 2) end
+end
+
+local function state_setter(state)
+  local fname = "client:set_" .. state
+  return function(c, on_)
+    local id = id_of(c, fname)
+    if type(on_) ~= "boolean" then error(fname .. ": expected true or false, got " .. describe(on_), 2) end
+    core.client_set_state(id, state, on_)
+  end
+end
+-- what the app is told; where and how big the window is stays the config's job
+methods.set_fullscreen = state_setter("fullscreen")
+methods.set_maximized  = state_setter("maximized")
+-- tells apps that draw their own decorations to drop shadows and round corners
+methods.set_tiled      = state_setter("tiled")
+
+-- hold a button down at x, y of the window; false if nothing is there
+function methods.press(c, x, y, button)
+  local id = id_of(c, "client:press")
+  if type(x) ~= "number" or type(y) ~= "number" then error("client:press: expected x and y", 2) end
+  if button ~= nil and type(button) ~= "number" then
+    error("client:press: expected a button from wm.button, got " .. describe(button), 2)
+  end
+  return core.client_press(id, x, y, button or buttons.left)
+end
+
+-- move the held pointer
+function methods.drag(c, x, y)
+  local id = id_of(c, "client:drag")
+  if type(x) ~= "number" or type(y) ~= "number" then error("client:drag: expected x and y", 2) end
+  core.client_drag(id, x, y)
+end
+
+function methods.release(c, button)
+  local id = id_of(c, "client:release")
+  if button ~= nil and type(button) ~= "number" then
+    error("client:release: expected a button from wm.button, got " .. describe(button), 2)
+  end
+  core.client_release(id, button or buttons.left)
 end
 
 function methods.set_activated(c, on_)
@@ -191,10 +314,18 @@ local function make_client(id, node)
       local m = methods[k]
       if m then return m end
       if live[k] then return core.client_get(id, k) end
+      if k == "parent" then
+        local p = core.client_get(id, "parent")
+        return p and clients[p]
+      end
+      if k == "fixed_size" then  -- min == max: a dialog or a splash screen
+        local w, h = core.client_get(id, "min_width"), core.client_get(id, "min_height")
+        return w > 0 and h > 0 and w == core.client_get(id, "max_width") and h == core.client_get(id, "max_height")
+      end
       return nil -- the config's own fields that are not set yet
     end,
     __newindex = function(t, k, v)
-      if k == "node" or k == "id" or methods[k] or live[k] then
+      if k == "node" or k == "id" or methods[k] or live[k] or k == "parent" or k == "fixed_size" then
         error("client." .. tostring(k) .. " is read-only", 2)
       end
       rawset(t, k, v)
@@ -205,14 +336,58 @@ local function make_client(id, node)
   })
 end
 
+---- layer surfaces (bars, wallpapers, launchers) ----
+
+local layers = {}                                 -- id -> layer table
+local layer_ids = setmetatable({}, { __mode = "k" }) -- layer table -> id
+local layer_live = {
+  namespace = true, layer = true, output = true, x = true, y = true, width = true, height = true,
+  keyboard = true, exclusive_zone = true, closed = true,
+}
+
+local function make_layer(id, node)
+  local l = {}
+  layer_ids[l] = id
+  return setmetatable(l, {
+    __index = function(_, k)
+      if k == "node" then return node end
+      if k == "id" then return id end
+      if layer_live[k] then return core.layer_get(id, k) end
+      return nil
+    end,
+    __newindex = function(t, k, v)
+      if k == "node" or k == "id" or layer_live[k] then
+        error("layer." .. tostring(k) .. " is read-only", 2)
+      end
+      rawset(t, k, v)
+    end,
+    __tostring = function()
+      return ("layer %d (%s)"):format(id, core.layer_get(id, "namespace") or "?")
+    end,
+  })
+end
+
 ---- dispatch (called by the core) ----
+
+-- a traceback without MyWM's own frames
+local function traceback(msg)
+  local out = {}
+  for line in debug.traceback(msg, 2):gmatch("[^\n]+") do
+    if not (line:find("prelude:", 1, true) or line:find("[C]: in function 'xpcall'", 1, true)
+        or line:find("(...tail calls...)", 1, true)) then
+      out[#out + 1] = line
+    end
+  end
+  if out[#out] == "stack traceback:" then out[#out] = nil end
+  return table.concat(out, "\n")
+end
 
 local function run(name, list, ...)
   local consumed = false
   -- copy, so a handler may unsubscribe while we iterate
   local copy = table.move(list, 1, #list, 1, {})
   for _, h in ipairs(copy) do
-    local ok, res = xpcall(h, debug.traceback, ...)
+    local ok, res = xpcall(h, traceback, ...)
     if not ok then
       core.report(name, tostring(res))
     elseif res == true then
@@ -222,22 +397,61 @@ local function run(name, list, ...)
   return consumed
 end
 
-local function dispatch(name, a, b, c, d)
+local function dispatch(name, a, b, c, d, e, f)
   local list = handlers[name]
   if name == "client.new" then
     clients[a] = make_client(a, b)
     return run(name, list, clients[a])
-  elseif name == "client.ready" or name == "client.resize" then
+  elseif name == "client.ready" or name == "client.resize" or name == "client.title"
+      or name == "client.enter" or name == "client.leave" or name == "client.request_minimize" then
+    if not clients[a] then return false end
     return run(name, list, clients[a])
+  elseif name == "client.request_fullscreen" or name == "client.request_maximize" then
+    if not clients[a] then return false end
+    return run(name, list, clients[a], { on = b })
+  elseif name == "client.request_move" then
+    if not clients[a] then return false end
+    return run(name, list, clients[a], { button = b })
+  elseif name == "client.request_resize" then
+    if not clients[a] then return false end
+    local edges = { top = c & 1 ~= 0, bottom = c & 2 ~= 0, left = c & 4 ~= 0, right = c & 8 ~= 0 }
+    return run(name, list, clients[a], { button = b, edges = edges })
   elseif name == "client.closed" then
     local cl = clients[a]
     local r = run(name, list, cl)
     clients[a] = nil
     return r
+  elseif name == "layer.new" then
+    layers[a] = make_layer(a, b)
+    return run(name, list, layers[a])
+  elseif name == "layer.ready" or name == "layer.change" then
+    if not layers[a] then return false end
+    return run(name, list, layers[a])
+  elseif name == "layer.closed" then
+    local l = layers[a]
+    if not l then return false end
+    local r = run(name, list, l, { gone = b })
+    if b then layers[a] = nil end
+    return r
+  elseif name == "output.added" then
+    local info
+    for _, o in ipairs(core.outputs()) do
+      if o.name == a then info = o end
+    end
+    return run(name, list, info or { name = a, modes = {} })
+  elseif name == "output.frame" then
+    return run(name, list, { output = a, dt = b })
+  elseif name == "output.removed" then
+    return run(name, list, { name = a })
   elseif name == "input.key" then
     return run(name, list, { key = a, mods = b, pressed = c })
   elseif name == "input.button" then
-    return run(name, list, { x = a, y = b, button = c, pressed = d })
+    return run(name, list, { x = a, y = b, button = c, pressed = d, mods = e })
+  elseif name == "input.motion" then
+    run(name, list, { x = a, y = b, dx = c, dy = d, mods = e })
+    return false  -- motion always reaches the app
+  elseif name == "input.scroll" then
+    return run(name, list, { x = a, y = b, dx = c, dy = d, mods = e, wheel = f })
   else
     return run(name, list)
   end
@@ -272,13 +486,99 @@ local keyboard_fields = {
   repeat_rate = true, repeat_delay = true,
 }
 
+local pointer_fields = {
+  speed = "number", accel = "string", natural_scroll = "boolean", left_handed = "boolean",
+}
+local touchpad_fields = {
+  speed = "number", accel = "string", natural_scroll = "boolean", left_handed = "boolean",
+  tap = "boolean", disable_while_typing = "boolean",
+}
+
+local function pointer_settings(kind, fields)
+  local fname = "wm.input." .. kind
+  return function(t)
+    check_keys(fname, t, fields)
+    for k, v in pairs(t) do
+      if type(v) ~= fields[k] then
+        error(("%s: %s must be a %s, got %s"):format(fname, k, fields[k], describe(v)), 2)
+      end
+    end
+    if t.accel ~= nil and t.accel ~= "flat" and t.accel ~= "adaptive" then
+      error(fname .. ": accel must be wm.accel.flat or wm.accel.adaptive", 2)
+    end
+    local ok, err = pcall(core.pointer_settings, kind, t)
+    if not ok then error(tostring(err):match("^[^\n]*"):gsub("^runtime error: ", ""), 2) end
+  end
+end
+
 local input = strict("input field", "wm.input.", {
+  -- a client, a layer that takes keyboard input, or nil
   focus = function(c)
-    if c == nil then core.focus(nil) else core.focus(id_of(c, "wm.input.focus")) end
+    if c == nil then core.focus(nil)
+    elseif layer_ids[c] then core.focus(layer_ids[c])
+    else core.focus(id_of(c, "wm.input.focus")) end
   end,
   keyboard = function(t)
     check_keys("wm.input.keyboard", t, keyboard_fields)
     core.keyboard(t)
+  end,
+  mouse    = pointer_settings("mouse", pointer_fields),
+  touchpad = pointer_settings("touchpad", touchpad_fields),
+  -- where the pointer is: x, y
+  pointer = core.pointer,
+  warp = function(x, y)
+    if type(x) ~= "number" or type(y) ~= "number" then
+      error("wm.input.warp: expected x and y", 2)
+    end
+    core.warp(x, y)
+  end,
+})
+
+---- outputs ----
+
+local output_fields = { mode = true, position = true, scale = true }
+local mode_fields = { width = true, height = true, refresh = true }
+local position_fields = { x = true, y = true }
+
+-- o: an output from wm.outputs() / output.added, or its name
+local function configure_output(o, opts)
+  local name = type(o) == "table" and o.name or o
+  if type(name) ~= "string" then
+    error("wm.configure_output: expected an output or its name, got " .. describe(o), 2)
+  end
+  check_keys("wm.configure_output", opts, output_fields)
+  if opts.mode ~= nil then
+    check_keys("wm.configure_output: mode", opts.mode, mode_fields)
+    if type(opts.mode.width) ~= "number" or type(opts.mode.height) ~= "number" then
+      error("wm.configure_output: mode needs width and height", 2)
+    end
+  end
+  if opts.position ~= nil then
+    check_keys("wm.configure_output: position", opts.position, position_fields)
+  end
+  local ok, err = pcall(core.configure_output, name, opts)
+  if not ok then
+    error(tostring(err):match("^[^\n]*"):gsub("^runtime error: ", ""), 2)
+  end
+end
+
+---- environment ----
+
+-- wm.env.NAME reads and sets variables for the apps the config starts;
+-- assigning nil unsets one. MyWM's own environment is not touched.
+local env = setmetatable({}, {
+  __index = function(_, name)
+    if type(name) ~= "string" then error("wm.env: variable names are strings", 2) end
+    return core.env_get(name)
+  end,
+  __newindex = function(_, name, value)
+    if type(name) ~= "string" then error("wm.env: variable names are strings", 2) end
+    if type(value) == "number" then value = tostring(value) end
+    if value ~= nil and type(value) ~= "string" then
+      error(("wm.env.%s: expected a string, got %s"):format(name, describe(value)), 2)
+    end
+    local ok, err = pcall(core.env_set, name, value)
+    if not ok then error(tostring(err):match("^[^\n]*"):gsub("^runtime error: ", ""), 2) end
   end,
 })
 
@@ -303,6 +603,11 @@ wm = strict("wm field", "wm.", {
   button     = buttons,
   easing     = easing,
   decoration = decoration,
+  accel      = accel,
+  level      = levels,
+
+  notify       = notify,
+  notify_clear = core.notify_clear,
 
   on    = on,
   scene = scene,
@@ -315,11 +620,24 @@ wm = strict("wm field", "wm.", {
     end
     return out
   end,
+  layers = function()
+    local out = {}
+    for _, id in ipairs(core.layer_ids()) do
+      if layers[id] then out[#out + 1] = layers[id] end
+    end
+    return out
+  end,
+  layer_at = function(x, y)
+    local id = core.layer_at(x, y)
+    return id and layers[id]
+  end,
   client_at = function(x, y)
     local id = core.client_at(x, y)
     return id and clients[id]
   end,
   outputs = core.outputs,
+  env     = env,
+  configure_output = configure_output,
 
   spawn  = core.spawn,
   reload = core.reload,

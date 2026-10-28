@@ -2,7 +2,9 @@
 //!
 //! The core never decides what goes on screen. A client window is just a node
 //! of kind `Client`; it is drawn only while the config keeps it attached to
-//! the tree under `root`.
+//! the tree under `root`. A layer-shell surface (a bar, a wallpaper) has a
+//! `Layer` node: while the config leaves it out of the tree, the core draws
+//! the surface where it asked to be; once attached, the config places it.
 
 use std::{collections::HashMap, time::Instant};
 
@@ -14,6 +16,8 @@ new_key_type! {
 }
 
 pub type ClientId = u64;
+/// Layer surfaces count from the same counter as clients, so an id is either.
+pub type LayerId = u64;
 
 /// Lua generation that owns core-created nodes (root and client nodes).
 pub const CORE_OWNER: u32 = 0;
@@ -22,6 +26,14 @@ pub enum NodeKind {
     Group,
     Rect { color: [f32; 4], buffer: SolidColorBuffer },
     Client(ClientId),
+    Layer(LayerId),
+}
+
+/// Something in the scene that takes pointer input.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Hit {
+    Client(ClientId),
+    Layer(LayerId),
 }
 
 impl NodeKind {
@@ -30,6 +42,7 @@ impl NodeKind {
             NodeKind::Group => "group",
             NodeKind::Rect { .. } => "rect",
             NodeKind::Client(_) => "client",
+            NodeKind::Layer(_) => "layer",
         }
     }
 }
@@ -157,6 +170,7 @@ struct Anim {
 pub enum DrawItem {
     Rect { node: NodeId, x: f64, y: f64, alpha: f32 },
     Client { client: ClientId, x: f64, y: f64, alpha: f32 },
+    Layer { layer: LayerId, x: f64, y: f64, alpha: f32 },
 }
 
 /// Animation groups that ended during a tick.
@@ -258,8 +272,14 @@ impl Scene {
         let mut stack = vec![id];
         while let Some(n) = stack.pop() {
             let node = &self.nodes[n];
-            if let NodeKind::Client(c) = node.kind {
-                if is_live(c) {
+            // a layer node lives as long as its surface; the core frees it
+            let keep = match node.kind {
+                NodeKind::Client(c) => is_live(c),
+                NodeKind::Layer(_) => true,
+                _ => false,
+            };
+            if let NodeKind::Client(_) | NodeKind::Layer(_) = node.kind {
+                if keep {
                     let children = std::mem::take(&mut self.nodes[n].children);
                     self.nodes[n].parent = None;
                     for ch in children {
@@ -268,7 +288,9 @@ impl Scene {
                     }
                     continue;
                 }
-                freed.push(c);
+                if let NodeKind::Client(c) = node.kind {
+                    freed.push(c);
+                }
             }
             stack.extend(node.children.iter().copied());
             self.remove_anims_of(n);
@@ -489,29 +511,32 @@ impl Scene {
             NodeKind::Group => {}
             NodeKind::Rect { .. } => out.push(DrawItem::Rect { node: id, x, y, alpha: alpha as f32 }),
             NodeKind::Client(client) => out.push(DrawItem::Client { client, x, y, alpha: alpha as f32 }),
+            NodeKind::Layer(layer) => out.push(DrawItem::Layer { layer, x, y, alpha: alpha as f32 }),
         }
         for &c in &n.children {
             self.collect(c, x, y, alpha, out);
         }
     }
 
-    /// Client nodes that can receive pointer input, front to back, with
-    /// their absolute positions.
-    pub fn input_clients(&self) -> Vec<(ClientId, f64, f64)> {
+    /// Client and layer nodes that can receive pointer input, front to
+    /// back, with their absolute positions.
+    pub fn input_nodes(&self) -> Vec<(Hit, f64, f64)> {
         let mut out = Vec::new();
         self.collect_input(self.root, 0.0, 0.0, &mut out);
         out.reverse();
         out
     }
 
-    fn collect_input(&self, id: NodeId, ox: f64, oy: f64, out: &mut Vec<(ClientId, f64, f64)>) {
+    fn collect_input(&self, id: NodeId, ox: f64, oy: f64, out: &mut Vec<(Hit, f64, f64)>) {
         let n = &self.nodes[id];
         if !n.visible || !n.input || n.opacity <= 0.0 {
             return;
         }
         let (x, y) = (ox + n.x, oy + n.y);
-        if let NodeKind::Client(c) = n.kind {
-            out.push((c, x, y));
+        match n.kind {
+            NodeKind::Client(c) => out.push((Hit::Client(c), x, y)),
+            NodeKind::Layer(l) => out.push((Hit::Layer(l), x, y)),
+            _ => {}
         }
         for &c in &n.children {
             self.collect_input(c, x, y, out);

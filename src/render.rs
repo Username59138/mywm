@@ -1,6 +1,6 @@
 //! Turning the scene into render elements; shared by both backends.
 
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use smithay::{
     backend::{
@@ -17,7 +17,7 @@ use smithay::{
             gles::{GlesRenderer, GlesTexture},
         },
     },
-    desktop::utils::send_frames_surface_tree,
+    desktop::{space::SpaceElement, utils::send_frames_surface_tree},
     input::pointer::{CursorImageStatus, CursorImageSurfaceData},
     output::Output,
     utils::{IsAlive, Logical, Point, Rectangle, Scale, Transform},
@@ -49,6 +49,12 @@ pub fn scene_elements(
     scale: Scale<f64>,
 ) -> Vec<SceneElement> {
     let mut elements = Vec::new();
+    // X11 menus and tooltips first: they are above the whole scene
+    for w in sh.or_windows.iter().rev() {
+        let Some(x) = w.x11_surface() else { continue };
+        let loc = (x.geometry().loc.to_f64() - origin).to_physical_precise_round(scale);
+        elements.extend(w.render_elements::<SceneElement>(renderer, loc, scale, 1.0));
+    }
     for item in sh.scene.draw_list().iter().rev() {
         match *item {
             DrawItem::Rect { node, x, y, alpha } => {
@@ -56,6 +62,11 @@ pub fn scene_elements(
                     let loc = Point::<f64, Logical>::from((x - origin.x, y - origin.y)).to_physical_precise_round(scale);
                     elements.push(SolidColorRenderElement::from_buffer(buffer, loc, scale, alpha, Kind::Unspecified).into());
                 }
+            }
+            DrawItem::Layer { layer, x, y, alpha } => {
+                let Some(l) = sh.layers.get(&layer).filter(|l| l.stage == Stage::Ready) else { continue };
+                let loc = Point::<f64, Logical>::from((x - origin.x, y - origin.y)).to_physical_precise_round(scale);
+                elements.extend(l.surface.render_elements::<SceneElement>(renderer, loc, scale, alpha));
             }
             DrawItem::Client { client, x, y, alpha } => {
                 let Some(e) = sh.clients.get(&client) else { continue };
@@ -91,20 +102,44 @@ pub fn scene_elements(
     elements
 }
 
-/// Frame callbacks for the windows shown on this output. Windows that are
-/// not on screen get none, so they stop drawing until they are shown.
+/// Frame callbacks for the windows shown on this output, and enter/leave
+/// events so clients know which output (and scale) they are on. Windows
+/// that are not on screen get no frame callbacks, so they stop drawing
+/// until they are shown.
 pub fn send_frames(sh: &Shared, output: &Output, area: Rectangle<f64, Logical>, time: Duration) {
+    let mut shown = HashSet::new();
     for item in sh.scene.draw_list() {
+        if let DrawItem::Layer { layer, .. } = item {
+            if let Some(l) = sh.layers.get(&layer).filter(|l| l.stage == Stage::Ready) {
+                l.surface.send_frame(output, time, Some(Duration::ZERO), |_, _| Some(output.clone()));
+            }
+            continue;
+        }
         let DrawItem::Client { client, x, y, .. } = item else { continue };
         let Some(e) = sh.clients.get(&client) else { continue };
         if e.stage != Stage::Ready || e.snapshot.is_some() {
             continue;
         }
-        let size = e.window.geometry().size.to_f64();
-        if !area.overlaps(Rectangle::new((x, y).into(), size)) {
-            continue;
-        }
+        let rect = Rectangle::new((x, y).into(), e.window.geometry().size.to_f64());
+        let Some(mut overlap) = rect.intersection(area) else { continue };
+        overlap.loc -= rect.loc;
+        e.window.output_enter(output, overlap.to_i32_round());
         e.window.send_frame(output, time, Some(Duration::ZERO), |_, _| Some(output.clone()));
+        shown.insert(client);
+    }
+    for (id, e) in &sh.clients {
+        if e.stage == Stage::Ready && !shown.contains(id) {
+            e.window.output_leave(output);
+        }
+    }
+    for w in &sh.or_windows {
+        let Some(x) = w.x11_surface() else { continue };
+        let geo = x.geometry().to_f64();
+        if let Some(mut overlap) = geo.intersection(area) {
+            overlap.loc -= geo.loc;
+            w.output_enter(output, overlap.to_i32_round());
+            w.send_frame(output, time, Some(Duration::ZERO), |_, _| Some(output.clone()));
+        }
     }
 }
 
@@ -115,11 +150,12 @@ pub struct Cursor {
 }
 
 impl Cursor {
-    /// The "default" cursor of $XCURSOR_THEME at $XCURSOR_SIZE, or a plain
-    /// arrow when the theme cannot be read.
-    pub fn load() -> Cursor {
-        let theme = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".into());
-        let size: u32 = std::env::var("XCURSOR_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(24);
+    /// The "default" cursor of a theme (XCURSOR_THEME, else "default") at a
+    /// size (XCURSOR_SIZE, else 24), or a plain arrow when the theme cannot
+    /// be read.
+    pub fn load(theme: Option<String>, size: Option<String>) -> Cursor {
+        let theme = theme.unwrap_or_else(|| "default".into());
+        let size: u32 = size.and_then(|s| s.parse().ok()).unwrap_or(24);
 
         let image = xcursor::CursorTheme::load(&theme)
             .load_icon("default")

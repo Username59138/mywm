@@ -81,6 +81,9 @@ pub fn init(event_loop: &mut EventLoop<State>, state: &mut State) -> Result<(), 
 impl State {
     fn winit_render(&mut self) {
         self.pre_frame();
+        if let Some(output) = self.winit.as_ref().map(|w| w.output.clone()) {
+            self.emit_frame(&output);
+        }
         let presented = self.winit_draw();
 
         // After a swap, winit sends the next Redraw once the host compositor
@@ -105,7 +108,8 @@ impl State {
         let output = w.output.clone();
         let scale = output.current_scale().fractional_scale().into();
         let age = w.backend.buffer_age().unwrap_or(0);
-        let sh = self.shared.borrow();
+        let mut sh = self.shared.borrow_mut();
+        let width = sh.output_geometry().map_or(0, |g| g.size.w);
 
         let damage = {
             let (renderer, mut framebuffer) = match w.backend.bind() {
@@ -116,7 +120,9 @@ impl State {
                 }
             };
             // the host draws the pointer, so no cursor elements here
-            let elements = render::scene_elements(&sh, renderer, Point::from((0.0, 0.0)), scale);
+            let origin = Point::from((0.0, 0.0));
+            let mut elements = sh.notes.elements(renderer, origin, width, scale);
+            elements.extend(render::scene_elements(&sh, renderer, origin, scale));
             match w
                 .damage_tracker
                 .render_output(renderer, &mut framebuffer, age, &elements, CLEAR_COLOR)

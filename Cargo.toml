@@ -12,6 +12,7 @@ slotmap = "1"
 xcursor = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+fontdue = "0.9"
 
 [dependencies.smithay]
 version = "0.7"
@@ -26,6 +27,7 @@ features = [
     "renderer_gl",
     "wayland_frontend",
     "desktop",
+    "xwayland",
 ]
 
 [profile.dev.package."*"]

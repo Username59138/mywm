@@ -1,20 +1,25 @@
 mod config;
+mod focus;
 mod handlers;
+mod inject;
 mod input;
 mod ipc;
+mod layers;
 mod lua;
+mod notify;
 mod render;
 mod scene;
 mod snapshot;
 mod state;
 mod udev;
 mod winit;
+mod xwayland;
 
 use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use smithay::reexports::{calloop::EventLoop, wayland_server::Display};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     config::ConfigSource,
@@ -225,19 +230,28 @@ fn run_compositor(chosen: Option<Chosen>, nested: bool) -> Result<(), Box<dyn st
     if nested {
         // connects to the host compositor, so it must run before WAYLAND_DISPLAY changes
         winit::init(&mut event_loop, &mut state)?;
-    } else {
-        udev::init(&mut event_loop, &mut state)?;
     }
 
     let socket = ipc::socket_path(&state.socket_name);
     ipc::listen(&state.loop_handle, &socket)?;
 
+    let x_display = match xwayland::start(&mut state) {
+        Ok(n) => Some(n),
+        Err(e) => {
+            warn!("{e}; X11 apps will not run");
+            None
+        }
+    };
+
     // Safety: set before anything is spawned; no other thread reads the environment
     unsafe {
         std::env::set_var("WAYLAND_DISPLAY", &state.socket_name);
         std::env::set_var("MYWM_SOCKET", &socket);
-        // there is no XWayland yet; X11 apps would open on the host
-        std::env::remove_var("DISPLAY");
+        match x_display {
+            Some(n) => std::env::set_var("DISPLAY", format!(":{n}")),
+            // otherwise X11 apps would open on the host
+            None => std::env::remove_var("DISPLAY"),
+        }
         if !nested {
             std::env::set_var("XDG_SESSION_TYPE", "wayland");
             std::env::set_var("XDG_CURRENT_DESKTOP", "mywm");
@@ -245,7 +259,12 @@ fn run_compositor(chosen: Option<Chosen>, nested: bool) -> Result<(), Box<dyn st
     }
     info!("listening on WAYLAND_DISPLAY={}", state.socket_name.to_string_lossy());
 
+    // On a TTY the config comes first: monitors then show up through
+    // output.added, so the config picks their modes before they are lit.
     state.load_initial_config();
+    if !nested {
+        udev::init(&mut event_loop, &mut state)?;
+    }
 
     event_loop.run(None, &mut state, |_| {})?;
 

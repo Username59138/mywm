@@ -19,6 +19,7 @@ use smithay::{
             output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
         },
         egl::{EGLContext, EGLDisplay, context::ContextPriority},
+        input::InputEvent,
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{ImportDma, ImportMemWl, gles::GlesRenderer},
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
@@ -32,19 +33,22 @@ use smithay::{
         },
         drm::{
             Device as _,
-            control::{Device as _, ModeTypeFlags, connector, crtc},
+            control::{self, Device as _, ModeTypeFlags, connector, crtc},
         },
-        input::Libinput,
+        input::{
+            AccelProfile, Device as InputDevice, DeviceCapability, Libinput,
+        },
         rustix::fs::OFlags,
         wayland_server::backend::GlobalId,
     },
     utils::{DeviceFd, Logical, Rectangle, Scale},
+    wayland::drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd},
 };
 use tracing::{error, info, warn};
 
 use crate::{
     render::{self, CLEAR_COLOR, Cursor, SceneElement},
-    state::{Event, State},
+    state::{Accel, Event, PointerSettings, State},
 };
 
 /// 8-bit formats are supported everywhere, NVIDIA included.
@@ -57,6 +61,7 @@ struct Surface {
     output: Output,
     global: GlobalId,
     connector: connector::Handle,
+    modes: Vec<control::Mode>,
     drm_output: DrmOutput<Allocator, Exporter, (), DrmDeviceFd>,
     /// a frame is queued and waits for its vblank
     queued: bool,
@@ -75,6 +80,8 @@ struct Gpu {
 pub struct UdevData {
     session: LibSeatSession,
     libinput: Libinput,
+    /// input devices, for wm.input.mouse / touchpad
+    devices: Vec<InputDevice>,
     gpu: Option<Gpu>,
     cursor: Cursor,
     /// false while another VT is shown
@@ -84,6 +91,16 @@ pub struct UdevData {
 impl UdevData {
     pub fn renderer(&mut self) -> Option<&mut GlesRenderer> {
         self.gpu.as_mut().map(|g| &mut g.renderer)
+    }
+
+    pub fn set_cursor(&mut self, cursor: Cursor) {
+        self.cursor = cursor;
+    }
+
+    pub fn configure_devices(&mut self, mouse: &PointerSettings, touchpad: &PointerSettings) {
+        for device in &mut self.devices {
+            configure_device(device, mouse, touchpad);
+        }
     }
 
     pub fn change_vt(&mut self, vt: i32) {
@@ -105,6 +122,21 @@ pub fn init(event_loop: &mut EventLoop<'static, State>, state: &mut State) -> Re
     event_loop
         .handle()
         .insert_source(LibinputInputBackend::new(libinput.clone()), |event, _, state| {
+            match &event {
+                InputEvent::DeviceAdded { device } => {
+                    let mut device = device.clone();
+                    configure_device(&mut device, &state.mouse, &state.touchpad);
+                    if let Some(udev) = state.udev.as_mut() {
+                        udev.devices.push(device);
+                    }
+                }
+                InputEvent::DeviceRemoved { device } => {
+                    if let Some(udev) = state.udev.as_mut() {
+                        udev.devices.retain(|d| d != device);
+                    }
+                }
+                _ => {}
+            }
             state.process_input_event(event)
         })?;
 
@@ -116,8 +148,9 @@ pub fn init(event_loop: &mut EventLoop<'static, State>, state: &mut State) -> Re
     state.udev = Some(UdevData {
         session,
         libinput,
+        devices: Vec::new(),
         gpu: None,
-        cursor: Cursor::load(),
+        cursor: Cursor::load(state.env_var("XCURSOR_THEME"), state.env_var("XCURSOR_SIZE")),
         active: true,
     });
 
@@ -145,6 +178,17 @@ pub fn init(event_loop: &mut EventLoop<'static, State>, state: &mut State) -> Re
 }
 
 impl State {
+    /// The config may have changed XCURSOR_THEME / XCURSOR_SIZE.
+    pub fn reload_cursor(&mut self) {
+        if self.udev.is_none() {
+            return;
+        }
+        let cursor = Cursor::load(self.env_var("XCURSOR_THEME"), self.env_var("XCURSOR_SIZE"));
+        if let Some(udev) = self.udev.as_mut() {
+            udev.set_cursor(cursor);
+        }
+    }
+
     fn udev_add_gpu(&mut self, node: DrmNode, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let udev = self.udev.as_mut().ok_or("no session")?;
         let fd = udev
@@ -172,6 +216,16 @@ impl State {
             COLOR_FORMATS.iter().copied(),
             render_formats,
         );
+
+        // explicit sync: clients (NVIDIA ones above all) tell us when their
+        // buffer is ready instead of relying on implicit fences
+        let device_fd = outputs.device().device_fd().clone();
+        if supports_syncobj_eventfd(&device_fd) {
+            self.syncobj = Some(DrmSyncobjState::new::<State>(&self.display_handle, device_fd));
+            info!("explicit sync enabled");
+        } else {
+            info!("the GPU driver does not support explicit sync");
+        }
 
         let token = self
             .loop_handle
@@ -265,16 +319,15 @@ impl State {
 
     fn udev_add_surface(&mut self, info: connector::Info, crtc: crtc::Handle) {
         let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
-        let Some(&mode) = info
-            .modes()
+        let modes = info.modes().to_vec();
+        let Some(&preferred) = modes
             .iter()
             .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
-            .or_else(|| info.modes().first())
+            .or_else(|| modes.first())
         else {
             warn!("{name}: the monitor reports no modes");
             return;
         };
-        let wl_mode = WlMode::from(mode);
         let (w_mm, h_mm) = info.size().unwrap_or((0, 0));
         let output = Output::new(
             name.clone(),
@@ -285,6 +338,9 @@ impl State {
                 model: "Unknown".into(),
             },
         );
+        for m in &modes {
+            output.add_mode(WlMode::from(*m));
+        }
 
         // to the right of the outputs that are already there
         let x = self
@@ -296,8 +352,22 @@ impl State {
             })
             .max()
             .unwrap_or(0);
-        output.set_preferred(wl_mode);
-        output.change_current_state(Some(wl_mode), None, None, Some((x, 0).into()));
+        output.set_preferred(WlMode::from(preferred));
+        output.change_current_state(Some(WlMode::from(preferred)), None, None, Some((x, 0).into()));
+
+        // The config sees the monitor before it is lit and may choose its
+        // mode, position and scale (applied to `output` right away).
+        self.outputs.push(output.clone());
+        self.update_outputs();
+        self.emit(Event::OutputAdded(name.clone()));
+        self.apply_output_config(&name);
+
+        let wl_mode = output.current_mode().unwrap_or(WlMode::from(preferred));
+        let mode = modes
+            .iter()
+            .copied()
+            .find(|m| WlMode::from(*m) == wl_mode)
+            .unwrap_or(preferred);
         let global = output.create_global::<State>(&self.display_handle);
 
         let gpu = self.udev.as_mut().and_then(|u| u.gpu.as_mut()).unwrap();
@@ -325,29 +395,56 @@ impl State {
             Err(e) => {
                 warn!("{name}: cannot set up the output: {e}");
                 self.display_handle.remove_global::<State>(global);
+                self.outputs.retain(|o| o != &output);
+                self.update_outputs();
+                self.emit(Event::OutputRemoved(name));
                 return;
             }
         };
 
+        let loc = output.current_location();
         info!(
-            "output {name}: {}x{} @ {:.2} Hz at x = {x}",
-            wl_mode.size.w,
-            wl_mode.size.h,
-            wl_mode.refresh as f64 / 1000.0
+            "output {name}: {} at {},{}",
+            crate::state::format_mode(&WlMode::from(mode)),
+            loc.x,
+            loc.y
         );
         gpu.surfaces.insert(
             crtc,
             Surface {
-                output: output.clone(),
+                output,
                 global,
                 connector: info.handle(),
+                modes,
                 drm_output,
                 queued: false,
                 timer: None,
             },
         );
-        self.outputs.push(output);
         self.loop_handle.insert_idle(move |state| state.udev_render(crtc));
+    }
+
+    /// Switch a lit output to another of its modes. An output that is not
+    /// lit yet only needs its state changed, so that counts as success.
+    pub fn udev_set_mode(&mut self, output: &Output, mode: WlMode) -> bool {
+        let Some(gpu) = self.udev.as_mut().and_then(|u| u.gpu.as_mut()) else { return false };
+        let Some((&crtc, surface)) = gpu.surfaces.iter().find(|(_, s)| &s.output == output) else {
+            return true;
+        };
+        let Some(drm_mode) = surface.modes.iter().copied().find(|m| WlMode::from(*m) == mode) else {
+            return false;
+        };
+        let elements: DrmOutputRenderElements<GlesRenderer, SceneElement> = DrmOutputRenderElements::default();
+        match gpu.outputs.use_mode(&crtc, drm_mode, &mut gpu.renderer, &elements) {
+            Ok(()) => {
+                self.loop_handle.insert_idle(move |state| state.udev_render(crtc));
+                true
+            }
+            Err(e) => {
+                warn!("{}: cannot switch the mode: {e}", output.name());
+                false
+            }
+        }
     }
 
     fn udev_remove_surface(&mut self, crtc: crtc::Handle) {
@@ -358,7 +455,10 @@ impl State {
         }
         self.display_handle.remove_global::<State>(surface.global);
         info!("output {} disconnected", surface.output.name());
+        self.close_layers_on(&surface.output.name());
         self.outputs.retain(|o| o != &surface.output);
+        self.update_outputs();
+        self.emit(Event::OutputRemoved(surface.output.name()));
     }
 
     fn udev_surface(&mut self, crtc: crtc::Handle) -> Option<&mut Surface> {
@@ -381,16 +481,19 @@ impl State {
         if !self.udev.as_ref().is_some_and(|u| u.active) {
             return;
         }
+        let Some(output) = self.udev_surface(crtc).and_then(|s| {
+            // a vblank or the timer brings the next render
+            (!s.queued && s.timer.is_none()).then(|| s.output.clone())
+        }) else {
+            return;
+        };
         self.pre_frame();
+        self.emit_frame(&output);
 
         let Some(udev) = self.udev.as_mut() else { return };
         let Some(gpu) = udev.gpu.as_mut() else { return };
         let Some(surface) = gpu.surfaces.get_mut(&crtc) else { return };
-        if surface.queued || surface.timer.is_some() {
-            return; // a vblank or the timer brings the next render
-        }
 
-        let output = surface.output.clone();
         let scale = Scale::from(output.current_scale().fractional_scale());
         let origin = output.current_location().to_f64();
         let size = output
@@ -399,7 +502,7 @@ impl State {
             .unwrap_or_default();
         let area: Rectangle<f64, Logical> = Rectangle::new(origin, size);
 
-        let sh = self.shared.borrow();
+        let mut sh = self.shared.borrow_mut();
         let pointer = self.seat.get_pointer().unwrap().current_location();
         let mut elements = Vec::new();
         if area.contains(pointer) {
@@ -411,6 +514,7 @@ impl State {
                 scale,
             ));
         }
+        elements.extend(sh.notes.elements(&mut gpu.renderer, origin, size.w.round() as i32, scale));
         elements.extend(render::scene_elements(&sh, &mut gpu.renderer, origin, scale));
 
         let rendered = match surface
@@ -483,6 +587,47 @@ impl State {
                 s.queued = false;
             }
             self.loop_handle.insert_idle(move |state| state.udev_render(crtc));
+        }
+    }
+}
+
+/// Apply the config's settings to a pointer device; what the config leaves
+/// out gets the device default. Devices that can tap are touchpads.
+fn configure_device(device: &mut InputDevice, mouse: &PointerSettings, touchpad: &PointerSettings) {
+    if !device.has_capability(DeviceCapability::Pointer) {
+        return;
+    }
+    let is_touchpad = device.config_tap_finger_count() > 0;
+    let s = if is_touchpad { touchpad } else { mouse };
+
+    if device.config_accel_is_available() {
+        let speed = s.speed.unwrap_or_else(|| device.config_accel_default_speed());
+        let _ = device.config_accel_set_speed(speed);
+        let profile = match s.accel {
+            Some(Accel::Flat) => Some(AccelProfile::Flat),
+            Some(Accel::Adaptive) => Some(AccelProfile::Adaptive),
+            None => device.config_accel_default_profile(),
+        };
+        if let Some(p) = profile
+            && device.config_accel_profiles().contains(&p)
+        {
+            let _ = device.config_accel_set_profile(p);
+        }
+    }
+    if device.config_scroll_has_natural_scroll() {
+        let on = s.natural_scroll.unwrap_or_else(|| device.config_scroll_default_natural_scroll_enabled());
+        let _ = device.config_scroll_set_natural_scroll_enabled(on);
+    }
+    if device.config_left_handed_is_available() {
+        let on = s.left_handed.unwrap_or_else(|| device.config_left_handed_default());
+        let _ = device.config_left_handed_set(on);
+    }
+    if is_touchpad {
+        let on = s.tap.unwrap_or_else(|| device.config_tap_default_enabled());
+        let _ = device.config_tap_set_enabled(on);
+        if device.config_dwt_is_available() {
+            let on = s.dwt.unwrap_or_else(|| device.config_dwt_default_enabled());
+            let _ = device.config_dwt_set_enabled(on);
         }
     }
 }

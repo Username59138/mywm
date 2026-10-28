@@ -21,6 +21,21 @@ wm.input.keyboard {
   options = "grp:alt_shift_toggle",
 }
 
+---- monitors ----
+
+-- the largest resolution at its highest refresh rate (the monitor's own
+-- "preferred" mode is often 60 Hz)
+wm.on(ev.output.added, function(o)
+  local best
+  for _, m in ipairs(o.modes) do
+    local area, best_area = m.width * m.height, best and best.width * best.height or 0
+    if area > best_area or (area == best_area and m.refresh > best.refresh) then
+      best = m
+    end
+  end
+  if best then wm.configure_output(o, { mode = best }) end
+end)
+
 ---- the tree ----
 --
 -- Each workspace holds a binary tree. A leaf is { client = c }, an inner
@@ -114,10 +129,18 @@ end
 local function tile(ws)
   local out = wm.outputs()[1]
   if not out or not ws.tree then return end
-  layout(ws.tree, { x = out.x + GAP, y = out.y + GAP, w = out.width - 2 * GAP, h = out.height - 2 * GAP })
+  local u = out.usable  -- what bars leave free
+  layout(ws.tree, { x = u.x + GAP, y = u.y + GAP, w = u.width - 2 * GAP, h = u.height - 2 * GAP })
 end
 
 ---- workspaces and focus ----
+
+-- bars, wallpapers and launchers each have a layer; the ones under the
+-- windows come first
+local layers = { background = scene.group {}, bottom = scene.group {} }
+scene.root:add(layers.background)
+scene.root:add(layers.bottom)
+
 
 local workspaces = {}
 for i = 1, 9 do
@@ -125,6 +148,10 @@ for i = 1, 9 do
   scene.root:add(node)
   workspaces[i] = { node = node, tree = nil, last = nil }
 end
+
+layers.top, layers.overlay = scene.group {}, scene.group {}
+scene.root:add(layers.top)
+scene.root:add(layers.overlay)
 
 local current = workspaces[1]
 local focused = nil
@@ -142,6 +169,19 @@ local function focus(c)
     c.ws.last = c  -- the next window on this workspace splits this one
   end
 end
+
+---- bars, wallpapers, launchers: where they ask to be ----
+
+wm.on(ev.layer.ready, function(l)
+  layers[l.layer]:add(l.node)
+  l.node.x, l.node.y = l.x, l.y
+  if l.keyboard == "exclusive" then wm.input.focus(l) end  -- a launcher
+end)
+
+wm.on(ev.layer.change, function(l) l.node.x, l.node.y = l.x, l.y end)
+
+-- a launcher closed: the keyboard goes back to the window
+wm.on(ev.layer.closed, function() wm.input.focus(focused) end)
 
 ---- clients ----
 

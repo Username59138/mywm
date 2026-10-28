@@ -1,5 +1,6 @@
-//! Input: every key press and button press goes to the config first. A
-//! handler that returns true consumes it; otherwise it reaches the client.
+//! Input: every key press, button press and scroll goes to the config
+//! first. A handler that returns true consumes it; otherwise it reaches the
+//! client. Pointer motion is reported too, but always reaches the client.
 
 use smithay::{
     backend::input::{
@@ -7,7 +8,7 @@ use smithay::{
         KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
     },
     input::{
-        keyboard::{Keycode, Keysym},
+        keyboard::{Keycode, Keysym, ModifiersState},
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
     utils::{Logical, Point, SERIAL_COUNTER},
@@ -23,6 +24,23 @@ const MOD_SUPER: u32 = 8;
 /// XF86Switch_VT_1; Ctrl+Alt+F1 produces it with the default keymap
 const KEY_SWITCH_VT_1: u32 = 0x1008_fe01;
 
+fn mod_bits(m: &ModifiersState) -> u32 {
+    let mut bits = 0;
+    if m.shift {
+        bits |= MOD_SHIFT;
+    }
+    if m.ctrl {
+        bits |= MOD_CTRL;
+    }
+    if m.alt {
+        bits |= MOD_ALT;
+    }
+    if m.logo {
+        bits |= MOD_SUPER;
+    }
+    bits
+}
+
 impl State {
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
         match event {
@@ -30,17 +48,20 @@ impl State {
             // a real mouse (libinput) reports movement, not positions
             InputEvent::PointerMotion { event, .. } => {
                 let pointer = self.seat.get_pointer().unwrap();
-                let mut pos = pointer.current_location() + event.delta();
-                if let Some(b) = self.shared.borrow().outputs_bbox() {
-                    pos.x = pos.x.clamp(b.loc.x as f64, (b.loc.x + b.size.w) as f64 - 1.0);
-                    pos.y = pos.y.clamp(b.loc.y as f64, (b.loc.y + b.size.h) as f64 - 1.0);
-                }
-                self.pointer_motion(pos, event.time_msec());
+                let pos = self.clamp_to_outputs(pointer.current_location() + event.delta());
+                self.on_motion(pos, event.delta(), event.time_msec());
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
                 let Some(geo) = self.shared.borrow().output_geometry() else { return };
                 let pos = event.position_transformed(geo.size) + geo.loc.to_f64();
-                self.pointer_motion(pos, event.time_msec());
+                // the first position is where the pointer entered, not a move
+                let delta = if self.pointer_seen {
+                    pos - self.seat.get_pointer().unwrap().current_location()
+                } else {
+                    Point::default()
+                };
+                self.pointer_seen = true;
+                self.on_motion(pos, delta, event.time_msec());
             }
             InputEvent::PointerButton { event, .. } => {
                 self.on_button(event.button_code(), event.state(), event.time_msec())
@@ -56,20 +77,7 @@ impl State {
             // the key as it is in the first latin layout, without modifiers:
             // binds keep working with the Russian layout and with Shift held
             let sym = h.raw_latin_sym_or_raw_current_sym().unwrap_or_else(|| h.modified_sym());
-            let mut bits = 0;
-            if m.shift {
-                bits |= MOD_SHIFT;
-            }
-            if m.ctrl {
-                bits |= MOD_CTRL;
-            }
-            if m.alt {
-                bits |= MOD_ALT;
-            }
-            if m.logo {
-                bits |= MOD_SUPER;
-            }
-            (sym.raw(), bits, h.modified_sym().raw())
+            (sym.raw(), mod_bits(m), h.modified_sym().raw())
         });
         let pressed = state == KeyState::Pressed;
 
@@ -106,9 +114,48 @@ impl State {
         }
     }
 
+    /// The modifiers held right now, as wm.mod bits.
+    fn mods(&self) -> u32 {
+        mod_bits(&self.seat.get_keyboard().unwrap().modifier_state())
+    }
+
+    fn wants(&self, event: &str) -> bool {
+        self.lua.as_ref().is_some_and(|rt| rt.wants(event))
+    }
+
+    fn clamp_to_outputs(&self, mut pos: Point<f64, Logical>) -> Point<f64, Logical> {
+        if let Some(b) = self.shared.borrow().outputs_bbox() {
+            pos.x = pos.x.clamp(b.loc.x as f64, (b.loc.x + b.size.w) as f64 - 1.0);
+            pos.y = pos.y.clamp(b.loc.y as f64, (b.loc.y + b.size.h) as f64 - 1.0);
+        }
+        pos
+    }
+
+    /// The pointer moves first, so a handler sees the new position and may
+    /// warp it elsewhere.
+    fn on_motion(&mut self, pos: Point<f64, Logical>, delta: Point<f64, Logical>, time: u32) {
+        self.pointer_motion(pos, time);
+        if self.wants("input.motion") {
+            let mods = self.mods();
+            self.emit(Event::Motion { x: pos.x, y: pos.y, dx: delta.x, dy: delta.y, mods });
+        }
+    }
+
+    /// wm.input.warp: put the pointer somewhere (kept on the outputs).
+    pub fn warp_pointer(&mut self, x: f64, y: f64) {
+        let pos = self.clamp_to_outputs((x, y).into());
+        let time = self.start_time.elapsed().as_millis() as u32;
+        self.pointer_motion(pos, time);
+    }
+
     pub fn pointer_motion(&mut self, pos: Point<f64, Logical>, time: u32) {
         let pointer = self.seat.get_pointer().unwrap();
-        let under = self.shared.borrow().surface_under(pos);
+        let under = {
+            let mut sh = self.shared.borrow_mut();
+            sh.pointer = (pos.x, pos.y);
+            sh.surface_under(pos)
+        };
+        let hovered = self.shared.borrow().client_at(pos);
         pointer.motion(
             self,
             under,
@@ -119,6 +166,30 @@ impl State {
             },
         );
         pointer.frame(self);
+
+        if hovered != self.hovered {
+            let old = std::mem::replace(&mut self.hovered, hovered);
+            if let Some(id) = old {
+                self.emit(Event::ClientHover(id, false));
+            }
+            if let Some(id) = hovered {
+                self.emit(Event::ClientHover(id, true));
+            }
+        }
+    }
+
+    /// A press on a notification dismisses it and goes nowhere else.
+    fn click_note(&mut self, pos: Point<f64, Logical>) -> bool {
+        let mut sh = self.shared.borrow_mut();
+        let corners: Vec<Point<f64, Logical>> = sh
+            .outputs
+            .iter()
+            .filter(|o| {
+                pos.x >= o.x as f64 && pos.x < (o.x + o.width) as f64 && pos.y >= o.y as f64 && pos.y < (o.y + o.height) as f64
+            })
+            .map(|o| Point::from(((o.x + o.width) as f64, o.y as f64)))
+            .collect();
+        corners.into_iter().any(|c| sh.notes.click(pos - c))
     }
 
     /// The scene may have moved under a still pointer.
@@ -129,7 +200,8 @@ impl State {
         }
         let pos = pointer.current_location();
         let under = self.shared.borrow().surface_under(pos);
-        if under.as_ref().map(|(s, _)| s) != pointer.current_focus().as_ref() {
+        let hovered = self.shared.borrow().client_at(pos);
+        if under.as_ref().map(|(s, _)| s) != pointer.current_focus().as_ref() || hovered != self.hovered {
             let time = self.start_time.elapsed().as_millis() as u32;
             self.pointer_motion(pos, time);
         }
@@ -140,7 +212,11 @@ impl State {
         let pressed = state == ButtonState::Pressed;
         let pos = pointer.current_location();
 
-        let event = Event::Button { x: pos.x, y: pos.y, button, pressed };
+        if pressed && self.click_note(pos) {
+            self.suppressed_buttons.insert(button);
+            return;
+        }
+        let event = Event::Button { x: pos.x, y: pos.y, button, pressed, mods: self.mods() };
         let consumed = if !pressed && self.suppressed_buttons.remove(&button) {
             self.emit(event);
             true
@@ -190,6 +266,15 @@ impl State {
         }
 
         let pointer = self.seat.get_pointer().unwrap();
+        let (dx, dy) = (amount(Axis::Horizontal), amount(Axis::Vertical));
+        if (dx != 0.0 || dy != 0.0) && self.wants("input.scroll") {
+            let pos = pointer.current_location();
+            let wheel = source == AxisSource::Wheel || source == AxisSource::WheelTilt;
+            let event = Event::Scroll { x: pos.x, y: pos.y, dx, dy, wheel, mods: self.mods() };
+            if self.emit(event) {
+                return;
+            }
+        }
         pointer.axis(self, frame);
         pointer.frame(self);
     }
